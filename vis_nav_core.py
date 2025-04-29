@@ -1,4 +1,4 @@
-__version__ = '1.2.2'
+__version__ = '1.2.4'
 
 import os
 import sys
@@ -89,6 +89,43 @@ class KeyboardPlayerPyBullet(Player):
         cv2.imshow('KeyboardPlayer:fpv', fpv)
         cv2.waitKey(1)
         return
+
+
+def capture_bev(img_size=500):
+    camera_target_position = [3, 3, -6]
+    PB.resetDebugVisualizerCamera(
+        cameraDistance=10,
+        cameraYaw=180,
+        cameraPitch=-89.8,
+        cameraTargetPosition=camera_target_position
+    )
+
+    view_matrix = PB.computeViewMatrixFromYawPitchRoll(
+        camera_target_position,
+        10,  # distance
+        180,  # yaw
+        -89.8,  # pitch
+        0,  # roll
+        2  # upAxisIndex
+    )
+
+    projection_matrix = PB.computeProjectionMatrixFOV(
+        100,  # fov
+        1,  # aspect ratio
+        0.02,  # Znear
+        10, # Zfar
+    )
+
+    # Get the camera image
+    img = PB.getCameraImage(
+        img_size, img_size,
+        view_matrix,
+        projection_matrix,
+        flags=PB.ER_NO_SEGMENTATION_MASK)[2]
+
+    # Convert the image to BGR format for opencv
+    bev = np.array(img[:, :, 2::-1])  # RGBA -> BGR
+    return bev
 
 
 def capture_fpv(robot_id, camera_K, bot_pos=None, bot_orn=None, camera_height=0.15, look_distance=5,
@@ -225,7 +262,7 @@ class Game:
             return [self.phase, self.step, self.time, self.fps, self.bot_action] + \
                    list(self.bot_pos) + list(self.bot_orn)
 
-    def __init__(self, player=None, do_pybullet_gui=False, time_step=0.01, save_video=0):
+    def __init__(self, player=None, do_pybullet_gui=False, time_step=0.01):
         def define_robot(position):
             mass = 1.0  # Mass of the robot
 
@@ -270,7 +307,6 @@ class Game:
         self.player.set_camera_intrinsic_matrix(Game.CAMERA_K)
 
         self.do_pybullet_gui = do_pybullet_gui
-        self.save_video = save_video  # 0 means no, 1 means navigation phase only, 2 means both phases
 
         self.pid = PB.connect(PB.GUI if self.do_pybullet_gui else PB.DIRECT)
         if do_pybullet_gui:
@@ -384,16 +420,18 @@ class Game:
             logging.info(f"Missing {maze_file}, downloading it...")
             download_maze()
         elif not verify_md5(maze_file):
-            logging.debug(f"{maze_file} did not pass MD5 test, downloading the correct one...")
+            logging.info(f"{maze_file} did not pass MD5 test, downloading the correct one...")
             download_maze()
         else:
             logging.info(f"Verified {maze_file}")
 
-    def replay(self, game_file_path):
-        save_path = game_file_path[:-3]+'avi'
+        print(f'!!! PLEASE MAKE SURE THE FOLLOWING FILE INFORMATION MATCH YOUR EXPECTATION '
+              f'(especially if you have a startup.json) !!!\n'
+              f'"MAZE_FILE_MD5_KEY": "{Game.MAZE_FILE_MD5_KEY}"\n'
+              f'"MAZE_FILE_ID": "{Game.MAZE_FILE_ID}"\n'
+              f'"ESSENTIAL_FILE_ID": "{Game.ESSENTIAL_FILE_ID}"\n')
 
-        video = None
-
+    def replay(self, game_file_path, save_phase='navigation', save_video_mode='avi'):
         game = nopub.load_game_file(game_file_path)
         if len(game.shape) == 0:
             game = game.item()
@@ -403,6 +441,10 @@ class Game:
                 return f'{s}={game[s]} saved in {game_file_path} does not match the one used in ' \
                        f'vis_nav_game.core ({getattr(self, s)})'
 
+            if game_version != __version__:
+                logging.warning(
+                    f'game version ({game_version}) saved in {game_file_path} does not match the one in'
+                    f'the current vis_nav_game.core ({__version__})')
             if game['ESSENTIAL_FILE_ID'] != Game.ESSENTIAL_FILE_ID:
                 raise Warning(warn_msg('ESSENTIAL_FILE_ID'))
             if game['MAZE_FILE_ID'] != Game.MAZE_FILE_ID:
@@ -418,6 +460,84 @@ class Game:
 
         if game.shape[0] == 0:
             raise ValueError(f'No data loaded from {game_file_path}!')
+
+        phases = game[:, 0]
+        nav_start_index = np.where(phases == Phase.NAVIGATION)[0]
+        if len(nav_start_index) == 0:
+            nav_start_index = None
+        else:
+            nav_start_index = nav_start_index[0]
+        game_exploration = game[:nav_start_index]
+        game_navigation = game[nav_start_index:]
+
+        def draw_line(start, end, color=[1, 0, 0], width=2):
+            # Calculate line direction and length
+            direction = np.array(end) - np.array(start)
+            length = np.linalg.norm(direction)
+            if length > 0.01:
+                # Find midpoint for cylinder placement
+                mid_point = (np.array(start) + np.array(end)) / 2
+                direction = direction / length
+                # Add alpha channel to color if not provided
+                if len(color) == 3:
+                    color = color + [1]
+                # Create cylinder shape
+                radius = width * 0.01  # Convert width to appropriate radius
+                visualShapeId = PB.createVisualShape(
+                    shapeType=PB.GEOM_CYLINDER,
+                    radius=radius,
+                    length=length,
+                    rgbaColor=color
+                )
+                # Calculate rotation to align cylinder with direction
+                from_direction = [0, 0, 1]  # Default cylinder orientation
+                to_direction = direction.tolist()
+                # Get rotation axis and angle
+                axis = np.cross(from_direction, to_direction)
+                if np.linalg.norm(axis) < 1e-6:
+                    # Vectors are parallel, rotation axis is arbitrary
+                    rot = PB.getQuaternionFromEuler([0, 0, 0])
+                else:
+                    angle = np.arccos(np.dot(from_direction, to_direction))
+                    axis = axis / np.linalg.norm(axis)
+                    rot = PB.getQuaternionFromEuler([axis[0] * angle, axis[1] * angle, axis[2] * angle])
+                # Create body for the line segment
+                PB.createMultiBody(
+                    baseMass=0,
+                    baseVisualShapeIndex=visualShapeId,
+                    basePosition=mid_point,
+                    baseOrientation=rot
+                )
+            # PB.stepSimulation()
+
+        def plot_traj(game_phase, lineColorRGB=[1, 0, 0], lineWidth=1):
+            if game_phase is None or len(game_phase) == 0:
+                return
+            bot_pos_j = game_phase[0, 5:8]
+            for i in range(game.shape[0]):
+                # phase_i, step_i, time_i, fps_i, bot_action_i = game_phase[i, :5]
+                bot_pos_i = game_phase[i, 5:8]
+                if np.linalg.norm(bot_pos_i-bot_pos_j) < 0.01:
+                    continue
+                ## sf: addUserDebugLine cannot be captured by PB.getCameraImage
+                # PB.addUserDebugLine(bot_pos_j, bot_pos_i,
+                #                     lineColorRGB=lineColorRGB, lineWidth=lineWidth)
+                draw_line(bot_pos_j, bot_pos_i, color=lineColorRGB, width=lineWidth)
+                bot_pos_j = bot_pos_i
+            self.set_pose(game_phase[-1, 5:8], game_phase[-1, 8:])
+            PB.stepSimulation()
+
+        def save_phase_frames(game_phase, save_folder_path):
+            if game_phase is None or len(game_phase) == 0:
+                return
+            for i in range(game.shape[0]):
+                # phase_i, step_i, time_i, fps_i, bot_action_i = game_phase[i, :5]
+                bot_pos_i, bot_orn_i = game_phase[i, 5:8], game_phase[i, 8:]
+                self.set_pose(bot_pos_i, bot_orn_i)
+                bot_fpv, _, _ = capture_fpv(None, Game.CAMERA_K, bot_pos=bot_pos_i, bot_orn=bot_orn_i)
+
+                save_path_i = os.path.join(save_folder_path, 'image_{0:04}.png'.format(i))
+                cv2.imwrite(save_path_i, bot_fpv)
 
         def draw_txt(txt, img_width):
             font = cv2.FONT_HERSHEY_SIMPLEX
@@ -435,43 +555,79 @@ class Game:
                         lineType=cv2.LINE_AA)
             return text_image
 
-        if self.save_video == 1:
-            game_phase = game[:, 0]
-            itemindex = np.where( game_phase==Phase.NAVIGATION )
-            game = game[itemindex[0][0]:]
+        def save_phase_video(game_phase, save_video_path):
+            if game_phase is None or len(game_phase) == 0:
+                return
+            video = None
+            for i in range(game.shape[0]):
+                phase_i, step_i, time_i, fps_i, bot_action_i = game_phase[i, :5]
+                bot_pos_i, bot_orn_i = game_phase[i, 5:8], game_phase[i, 8:]
+                self.set_pose(bot_pos_i, bot_orn_i)
+                bot_fpv, _, _ = capture_fpv(None, Game.CAMERA_K, bot_pos=bot_pos_i, bot_orn=bot_orn_i)
 
-        for i in range(game.shape[0]):
-            phase_i, step_i, time_i, fps_i, bot_action_i = game[i, :5]
-            bot_pos_i, bot_orn_i = game[i, 5:8], game[i, 8:]
-            self.set_pose(bot_pos_i, bot_orn_i)
-            bot_fpv, _, _ = capture_fpv(None, Game.CAMERA_K, bot_pos=bot_pos_i, bot_orn=bot_orn_i)
+                txt1 = time.strftime('%Y/%m/%d %H:%M:%S.', time.localtime(time_i)) + str(time_i).split('.')[1][:3]
+                txt2 = f"{phase_i.name} | step={step_i}"
+                txt3 = f'action={str(bot_action_i).split(".")[1]} | fps={fps_i:.1f}'
 
-            txt1 = time.strftime('%Y/%m/%d %H:%M:%S.', time.localtime(time_i)) + str(time_i).split('.')[1][:3]
-            txt2 = f"{phase_i.name} | step={step_i}"
-            txt3 = f'action={str(bot_action_i).split(".")[1]} | fps={fps_i:.1f}'
+                img_height, img_width, _ = bot_fpv.shape
 
-            img_height, img_width, _ = bot_fpv.shape
+                txt1_img = draw_txt(txt1, img_width)
+                txt2_img = draw_txt(txt2, img_width)
+                txt3_img = draw_txt(txt3, img_width)
 
-            txt1_img = draw_txt(txt1, img_width)
-            txt2_img = draw_txt(txt2, img_width)
-            txt3_img = draw_txt(txt3, img_width)
+                # Concatenate the text_image with the original image vertically
+                result_image = np.vstack((txt1_img, txt2_img, txt3_img, bot_fpv)).astype(np.uint8)
 
-            # Concatenate the text_image with the original image vertically
-            result_image = np.vstack((txt1_img, txt2_img, txt3_img, bot_fpv)).astype(np.uint8)
-
-            if self.save_video:
                 if video is None:
                     rimg_h, rimg_w, _ = result_image.shape
                     average_fps = np.round(game.shape[0] / np.abs(game[-1, 2] - game[0, 2]))
-                    video = cv2.VideoWriter(save_path, cv2.VideoWriter_fourcc(*'MJPG'), average_fps, (rimg_w, rimg_h))
+                    video = cv2.VideoWriter(save_video_path, cv2.VideoWriter_fourcc(*'MJPG'),
+                                            average_fps, (rimg_w, rimg_h))
                     if not video.isOpened():
                         raise RuntimeError('OpenCV Video Writer not opened!')
+
                 video.write(result_image)
 
-        if video is not None:
-            video.release()
+            if video is not None:
+                video.release()
 
-        return self.get_result(bot_pos_i, bot_orn_i)
+        save_path = game_file_path[:-4]
+        if save_video_mode is None or save_video_mode == '':
+            pass
+        elif save_video_mode == 'frames':
+            save_path_exp = os.path.join(save_path, 'exploration')
+            save_path_nav = os.path.join(save_path, 'navigation')
+            if save_phase == 'exploration':  # save exploration only
+                os.makedirs(save_path_exp)
+                save_phase_frames(game_exploration, save_path_exp)
+            elif save_phase == 'navigation':  # save navigation only
+                os.makedirs(save_path_nav)
+                save_phase_frames(game_navigation, save_path_nav)
+            else:  # save all phases
+                os.makedirs(save_path_exp)
+                save_phase_frames(game_exploration, save_path_exp)
+                os.makedirs(save_path_nav)
+                save_phase_frames(game_navigation, save_path_nav)
+        else:  # save video
+            os.makedirs(save_path)
+            save_path_exp = os.path.join(save_path, 'exploration.avi')
+            save_path_nav = os.path.join(save_path, 'navigation.avi')
+            if save_phase == 'exploration':  # save exploration only
+                save_phase_video(game_exploration, save_path_exp)
+            elif save_phase == 'navigation':  # save navigation only
+                save_phase_video(game_navigation, save_path_nav)
+            else:  # save all phases
+                save_phase_video(game_exploration, save_path_exp)
+                save_phase_video(game_navigation, save_path_nav)
+
+        # save final bev with the trajectory
+        plot_traj(game_navigation)
+        bev = capture_bev(1000)
+        cv2.imwrite(save_path+'.jpg', bev)
+        # TODO: plot the goal zone
+
+        bot_pos_final, bot_orn_final = game[-1, 5:8], game[-1, 8:]
+        return self.get_result(bot_pos_final, bot_orn_final)
 
     def set_texture(self, object_id, model_id, selected_texture_index):
         texture = PB.loadTexture(self.textures_path + "/pattern_{}.png".format(selected_texture_index))
@@ -542,12 +698,28 @@ class Game:
                     logging.error('Sometime wrong about the NAV_START_TIME: ' + str(e))
                     exit(-1)
 
-                system_time = time.time()
-                internet_time = 0
-                try:
-                    internet_time = ntplib.NTPClient().request('pool.ntp.org').tx_time
-                except ... as e:
-                    logging.error('Failed to get Internet time, due to: ' + str(e))
+                ntp_servers = [
+                    '0.pool.ntp.org',
+                    '1.pool.ntp.org',
+                    'time.google.com',
+                    'time.windows.com',
+                    'time.apple.com',
+                    'time.nist.gov'
+                    ]
+                # Attempt to fetch time from multiple NTP servers
+                for server in ntp_servers:
+                    system_time = time.time()
+                    internet_time = 0
+                    try:
+                        internet_time = ntplib.NTPClient().request(server).tx_time
+                        logging.info(f"Internet time fetched from {server}: {internet_time}")
+                        break  # Exit the loop on first successful fetch
+                    except Exception as e:
+                        logging.error(f"Failed to get time from {server}, due to: {str(e)}")
+
+                # Check if we managed to fetch internet time
+                if internet_time == 0:
+                    logging.error("All attempts to fetch Internet time failed.")
                     exit(-1)
 
                 time_diff = np.abs(system_time - internet_time)
@@ -594,7 +766,7 @@ class Game:
                 logging.info("Saving the game, please wait...")
                 data_dict = {
                     'data': self.data,
-                    'version':__version__,
+                    'version': __version__,
                     'MAZE_FILE_ID': Game.MAZE_FILE_ID,
                     'ESSENTIAL_FILE_ID': Game.ESSENTIAL_FILE_ID,
                     'MAZE_FILE_MD5_KEY': Game.MAZE_FILE_MD5_KEY
@@ -765,7 +937,10 @@ class Game:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(sys.argv[0])
     parser.add_argument('-m', '--mode', type=str, default='player', help='mode to start the server in')
-    parser.add_argument('-s', '--save', type=int, default=0, help='whether to save the video or not')
+    parser.add_argument('-s', '--save-phase', type=str, default='navigation',
+                        help='save exploration, navigation, or both phases')
+    parser.add_argument('-v', '--save-video', type=str, default='',
+                        help='save avi or frames or none')
     parser.add_argument('-i', '--gui', type=int, default=1, help='whether to open GUI or not')
     parser.add_argument('-f', '--file', type=str, help='game.npy file for reply')
     opt = parser.parse_args(sys.argv[1:])
@@ -774,13 +949,17 @@ if __name__ == "__main__":
                         format='%(asctime)s - %(levelname)s: %(message)s', datefmt='%d-%b-%y %H:%M:%S')
 
     if opt.mode == 'player':
-        sim = Game(do_pybullet_gui=(opt.gui == 1), save_video=opt.save)
+        sim = Game(do_pybullet_gui=(opt.gui == 1))
         sim.run()
     elif opt.mode == 'judge':
-        sim = Game(do_pybullet_gui=(opt.gui == 1), save_video=opt.save)
+        sim = Game(do_pybullet_gui=(opt.gui == 1))
         sim.load_data()
-        trans_error, rot_error = sim.replay(opt.file)
-        print(f"Translational Error : {trans_error}")
-        print(f"Rotational Error : {rot_error}")
+        t_err, r_err = sim.replay(opt.file, save_phase=opt.save_phase, save_video_mode=opt.save_video)
+        print(f"Translational Error : {t_err}")
+        print(f"Rotational Error : {r_err}")
+    elif opt.mode == 'prepare':
+        sim = Game(do_pybullet_gui=(opt.gui == 1))
+        sim.load_data()
+        sim.replay(opt.file, save_video_mode='')
     else:
         print("Invalid Mode!")
