@@ -47,5 +47,11 @@ python vis_nav_core.py
 
 ## View Player-submitted game.npy
 ```commandline
-python vis_nav_core.py -m judge -i 0 -f game.npy -s 1
+python vis_nav_core.py -m judge -i 0 -f game.npy
+```
+
+## Save Player-submitted game.npy to avi or frames
+```commandline
+python vis_nav_core.py -m judge -i 0 -f game.npy -v avi
+python vis_nav_core.py -m judge -i 0 -f game.npy -v frames
 ```
